@@ -5,78 +5,185 @@ import plotly.graph_objects as go
 import pandas as pd
 import numpy as np
 import yfinance as yf
-import requests
 import warnings
-
 warnings.filterwarnings("ignore")
 
-# ── CONFIG ────────────────────────────────────────────────────
-ALL_TICKERS = ["PAYTM.NS", "POLICYBZR.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS"]
+FINTECH_TICKERS = ["PAYTM.NS", "POLICYBZR.NS"]
+BANK_TICKERS    = ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS"]
+ALL_TICKERS     = FINTECH_TICKERS + BANK_TICKERS
+
 RBI_EVENTS = {
-    "2020-03-27": 4.40, "2020-05-22": 4.00, "2022-05-04": 4.40, 
-    "2022-06-08": 4.90, "2022-08-05": 5.40, "2022-09-30": 5.90,
-    "2022-12-07": 6.25, "2023-02-08": 6.50, "2025-02-07": 6.25, 
-    "2025-04-09": 6.00, "2026-04-09": 5.25,
+    "2020-03-27": 4.40, "2020-05-22": 4.00,
+    "2022-05-04": 4.40, "2022-06-08": 4.90,
+    "2022-08-05": 5.40, "2022-09-30": 5.90,
+    "2022-12-07": 6.25, "2023-02-08": 6.50,
+    "2025-02-07": 6.25, "2025-04-09": 6.00,
+    "2026-04-09": 5.25,
 }
 
-# ── DATA LOADING ──────────────────────────────────────────────
-session = requests.Session()
-session.headers.update({'User-Agent': 'Mozilla/5.0'})
-
-data = yf.download(ALL_TICKERS, start="2020-01-01", auto_adjust=True, session=session)
-prices = data["Close"].ffill()
+print("Downloading price data...")
+prices = yf.download(ALL_TICKERS, start="2020-01-01",
+                     auto_adjust=True, progress=False)["Close"]
+prices = prices.ffill()
 returns = prices.pct_change().dropna(how="all")
+print(f"Data loaded: {len(returns)} rows")
 
-# Align RBI shocks to market trading days
-rbi_s = pd.Series(RBI_EVENTS)
-rbi_s.index = pd.to_datetime(rbi_s.index)
-rbi_rate = rbi_s.reindex(returns.index.union(rbi_s.index)).sort_index().ffill()
-rbi_rate = rbi_rate.reindex(returns.index) 
-rbi_change = rbi_rate.diff().fillna(0)
+rbi_events = pd.Series(RBI_EVENTS, dtype=float)
+rbi_events.index = pd.to_datetime(rbi_events.index)
+rbi_rate   = rbi_events.reindex(returns.index).ffill()
+rbi_change = rbi_events.reindex(returns.index).fillna(0).diff().fillna(0)
 
-# ── APP SETUP ─────────────────────────────────────────────────
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.FLATLY])
-server = app.server  # CRITICAL: Render needs this for Gunicorn
+def compute_ccf(rate_change, stock_return, max_lag=60):
+    aligned = pd.concat([rate_change, stock_return], axis=1).dropna()
+    x = aligned.iloc[:, 0].values
+    y = aligned.iloc[:, 1].values
+    corrs = []
+    for k in range(max_lag + 1):
+        if k == 0:
+            corrs.append(np.corrcoef(
+                (x - x.mean())/(x.std()+1e-9),
+                (y - y.mean())/(y.std()+1e-9))[0,1])
+        else:
+            corrs.append(np.corrcoef(
+                (x[:-k] - x[:-k].mean())/(x[:-k].std()+1e-9),
+                (y[k:]  - y[k:].mean())/(y[k:].std()+1e-9))[0,1])
+    return pd.Series(corrs, index=range(max_lag + 1))
+
+def run_simulation(ticker, shock_bps, horizon, n_paths=500):
+    if ticker not in returns.columns:
+        return None
+    r = returns[ticker].dropna()
+    rolling_vol = r.rolling(21).std().iloc[-1]
+    shock_effect = shock_bps * 0.0003
+    np.random.seed(42)
+    paths = np.random.normal(shock_effect, rolling_vol,
+                              size=(n_paths, horizon))
+    cum_paths = np.cumsum(paths, axis=1) * 100
+    return {
+        "mean":    cum_paths.mean(axis=0),
+        "upper":   np.percentile(cum_paths, 90, axis=0),
+        "lower":   np.percentile(cum_paths, 10, axis=0),
+        "success": round((cum_paths[:, -1] > 0).mean() * 100, 1),
+    }
+
+def calc_success_rate(ticker, event_type, horizon):
+    if ticker not in returns.columns:
+        return 0, 0
+    rbi_chg = rbi_change.copy()
+    if event_type == "hold":
+        ev_dates = rbi_chg[rbi_chg == 0].dropna().index
+    elif event_type == "hike":
+        ev_dates = rbi_chg[rbi_chg > 0].dropna().index
+    else:
+        ev_dates = rbi_chg[rbi_chg < 0].dropna().index
+    r = returns[ticker]
+    successes = []
+    for ev in ev_dates:
+        idx = r.index.searchsorted(ev)
+        if idx + horizon >= len(r):
+            continue
+        cum = (1 + r.iloc[idx:idx+horizon]).prod() - 1
+        successes.append(int(cum > 0))
+    if not successes:
+        return 0, 0
+    return round(np.mean(successes) * 100, 1), len(successes)
+
+app = dash.Dash(__name__,
+                external_stylesheets=[dbc.themes.FLATLY],
+                suppress_callback_exceptions=True)
+server = app.server  # Required for Render deployment
 
 app.layout = dbc.Container([
     dbc.Row([
-        dbc.Col(html.H3("🏦 RBI Policy Dashboard", className="text-primary mt-3"), width=8),
-        dbc.Col(dbc.Badge("Repo Rate: 5.25%", color="info", className="mt-4 p-2"), width=4),
+        dbc.Col(html.H3("🏦 RBI Policy Impact — Fintech Dashboard",
+                         className="text-primary mt-3"), width=8),
+        dbc.Col(dbc.Badge("Repo Rate: 5.25% | Neutral | Apr 2026",
+                           color="info", className="mt-4 p-2"), width=4),
     ], className="mb-2"),
-    
+
     dbc.Tabs([
         dbc.Tab(label="📊 Lag Analysis", children=[
             dbc.Row([
                 dbc.Col([
-                    html.Label("Stock:", className="mt-3"),
-                    dcc.Dropdown(id="lag-ticker", options=[{"label": t, "value": t} for t in ALL_TICKERS], value="PAYTM.NS"),
+                    html.Label("Select Stock:", className="mt-3 fw-bold"),
+                    dcc.Dropdown(id="lag-ticker",
+                        options=[{"label": t, "value": t} for t in ALL_TICKERS],
+                        value="PAYTM.NS", clearable=False),
                 ], width=4),
                 dbc.Col([
-                    html.Label("Max Lag (days):", className="mt-3"),
-                    dcc.Slider(id="lag-max", min=10, max=60, step=10, value=30),
+                    html.Label("Max Lag (days):", className="mt-3 fw-bold"),
+                    dcc.Slider(id="lag-max", min=10, max=60, step=10, value=30,
+                               marks={d: str(d) for d in [10,20,30,40,60]}),
                 ], width=6),
             ]),
-            dcc.Graph(id="ccf-plot"),
-            html.Div(id="lag-summary", className="text-center text-muted")
+            dcc.Graph(id="ccf-plot", style={"height": "450px"}),
+            html.Div(id="lag-summary", className="text-center text-muted mb-3"),
         ]),
-        
+
         dbc.Tab(label="🎯 Success Probability", children=[
             dbc.Row([
+                dbc.Col([
+                    html.Label("Stock:", className="mt-3 fw-bold"),
+                    dcc.Dropdown(id="prob-ticker",
+                        options=[{"label": t, "value": t} for t in ALL_TICKERS],
+                        value="PAYTM.NS", clearable=False),
+                ], width=3),
+                dbc.Col([
+                    html.Label("Event Type:", className="mt-3 fw-bold"),
+                    dcc.Dropdown(id="prob-event",
+                        options=[{"label": e.title(), "value": e}
+                                 for e in ["hold", "hike", "cut"]],
+                        value="hold", clearable=False),
+                ], width=3),
+                dbc.Col([
+                    html.Label("Horizon (days):", className="mt-3 fw-bold"),
+                    dcc.Slider(id="prob-horizon", min=5, max=60, step=5, value=30,
+                               marks={d: str(d) for d in [5,10,20,30,60]}),
+                ], width=4),
+            ]),
+            dbc.Row([
                 dbc.Col(html.Div(id="success-card"), width=5),
-                dbc.Col(dcc.Graph(id="success-horizon-plot"), width=7),
+                dbc.Col(dcc.Graph(id="success-horizon-plot",
+                                  style={"height": "380px"}), width=7),
             ], className="mt-3"),
         ]),
 
-        dbc.Tab(label="👨‍💻 Source Code", children=[
-            html.H5("Core Correlation Logic", className="mt-4"),
-            html.Pre("""def compute_ccf(rate_change, stock_return, max_lag):
-    return [rate_change.corr(stock_return.shift(-k)) for k in range(max_lag + 1)]""", 
-            style={"backgroundColor": "#f8f9fa", "padding": "15px"})
-        ])
-    ])
-], fluid=True)
+        dbc.Tab(label="🔮 Scenario Simulator", children=[
+            dbc.Row([
+                dbc.Col([
+                    html.Label("Stock:", className="mt-3 fw-bold"),
+                    dcc.Dropdown(id="sim-ticker",
+                        options=[{"label": t, "value": t} for t in ALL_TICKERS],
+                        value="PAYTM.NS", clearable=False),
+                ], width=3),
+                dbc.Col([
+                    html.Label("Rate Shock:", className="mt-3 fw-bold"),
+                    dcc.Dropdown(id="sim-shock",
+                        options=[
+                            {"label": "−50 bps (Aggressive Cut)", "value": -50},
+                            {"label": "−25 bps (Cut)",            "value": -25},
+                            {"label": "0 bps (Hold)",             "value":   0},
+                            {"label": "+25 bps (Hike)",           "value":  25},
+                            {"label": "+50 bps (Aggressive Hike)","value":  50},
+                        ], value=0, clearable=False),
+                ], width=3),
+                dbc.Col([
+                    html.Label("Horizon (days):", className="mt-3 fw-bold"),
+                    dcc.Slider(id="sim-horizon", min=10, max=60, step=10, value=30,
+                               marks={d: str(d) for d in [10,20,30,60]}),
+                ], width=4),
+                dbc.Col(
+                    html.Button("▶ Run", id="sim-btn", n_clicks=0,
+                                className="btn btn-primary w-100 mt-4"),
+                    width=2),
+            ]),
+            dcc.Graph(id="sim-plot", style={"height": "420px"}),
+            html.Div(id="sim-result", className="mt-2"),
+        ]),
+    ]),
+], fluid=True, className="px-4")
 
-# ── CALLBACKS ─────────────────────────────────────────────────
+
 @app.callback(
     Output("ccf-plot", "figure"),
     Output("lag-summary", "children"),
@@ -84,11 +191,95 @@ app.layout = dbc.Container([
     Input("lag-max", "value"),
 )
 def update_ccf(ticker, max_lag):
-    y = returns[ticker]
-    corrs = [rbi_change.corr(y.shift(-k)) for k in range(max_lag + 1)]
-    fig = go.Figure(go.Bar(x=list(range(max_lag+1)), y=corrs))
-    fig.update_layout(title=f"Impact of Rate Changes on {ticker}", template="plotly_white")
-    return fig, f"Analysis complete for {ticker}"
+    if ticker not in returns.columns:
+        return go.Figure(), "No data."
+    ccf = compute_ccf(rbi_change, returns[ticker], max_lag)
+    ci  = 1.96 / np.sqrt(len(returns[ticker].dropna()))
+    peak_lag = int(ccf.abs().idxmax())
+    peak_val = round(ccf.abs().max(), 3)
+    fig = go.Figure()
+    fig.add_bar(x=ccf.index, y=ccf.values,
+                marker_color=["crimson" if v < 0 else "steelblue"
+                              for v in ccf.values])
+    fig.add_hline(y=ci,  line_dash="dash", line_color="gray",
+                  annotation_text="95% CI")
+    fig.add_hline(y=-ci, line_dash="dash", line_color="gray")
+    fig.update_layout(
+        title=f"Cross-Correlation: RBI Rate Change → {ticker} Returns",
+        xaxis_title="Lag (Trading Days)",
+        yaxis_title="Correlation",
+        template="plotly_white")
+    return fig, f"Peak lag: {peak_lag} days  |  Peak CCF: {peak_val}"
+
+
+@app.callback(
+    Output("success-card", "children"),
+    Output("success-horizon-plot", "figure"),
+    Input("prob-ticker", "value"),
+    Input("prob-event", "value"),
+    Input("prob-horizon", "value"),
+)
+def update_success(ticker, event_type, horizon):
+    rate, n = calc_success_rate(ticker, event_type, horizon)
+    color = "success" if rate >= 60 else ("warning" if rate >= 45 else "danger")
+    card = dbc.Card([dbc.CardBody([
+        html.H2(f"{rate}%", className=f"text-{color} display-4 fw-bold"),
+        html.P(f"Success rate of BUYING {ticker}", className="text-muted"),
+        html.P(f"{horizon} days after a rate {event_type.upper()}",
+               className="fw-semibold"),
+        html.Small(f"Based on {n} past RBI events", className="text-muted"),
+    ])], className="text-center shadow-sm mt-3")
+    horizons = [5, 10, 20, 30, 60]
+    rates = [calc_success_rate(ticker, event_type, h)[0] for h in horizons]
+    fig = go.Figure()
+    fig.add_scatter(x=horizons, y=rates, mode="lines+markers",
+                    line=dict(color="steelblue", width=2.5),
+                    marker=dict(size=8))
+    fig.add_hline(y=50, line_dash="dot", line_color="red",
+                  annotation_text="50% baseline")
+    fig.update_layout(
+        title=f"Success Rate vs Horizon — {ticker} ({event_type})",
+        xaxis_title="Horizon (days)", yaxis_title="Success Rate (%)",
+        template="plotly_white", yaxis=dict(range=[0, 100]))
+    return card, fig
+
+
+@app.callback(
+    Output("sim-plot", "figure"),
+    Output("sim-result", "children"),
+    Input("sim-btn", "n_clicks"),
+    State("sim-ticker", "value"),
+    State("sim-shock", "value"),
+    State("sim-horizon", "value"),
+    prevent_initial_call=True,
+)
+def update_simulation(n_clicks, ticker, shock, horizon):
+    result = run_simulation(ticker, shock, horizon)
+    if result is None:
+        return go.Figure(), "No data."
+    days = list(range(1, horizon + 1))
+    fig = go.Figure()
+    fig.add_scatter(x=days, y=result["upper"], mode="lines",
+                    line=dict(width=0), showlegend=False)
+    fig.add_scatter(x=days, y=result["lower"], mode="lines",
+                    fill="tonexty", fillcolor="rgba(70,130,180,0.15)",
+                    line=dict(width=0), name="80% CI")
+    fig.add_scatter(x=days, y=result["mean"], mode="lines",
+                    name="Mean Path", line=dict(color="steelblue", width=2.5))
+    fig.add_hline(y=0, line_dash="dot", line_color="red")
+    fig.update_layout(
+        title=f"{ticker} — Simulated Return | {shock:+d} bps | {horizon}d",
+        xaxis_title="Days After Announcement",
+        yaxis_title="Cumulative Return (%)",
+        template="plotly_white")
+    prob = result["success"]
+    color = "success" if prob >= 55 else ("warning" if prob >= 45 else "danger")
+    badge = dbc.Alert(
+        f"📊 Probability of positive return: {prob}% "
+        f"over {horizon} days after {shock:+d} bps shock",
+        color=color, className="text-center fw-bold")
+    return fig, badge
+
 
 if __name__ == '__main__':
-    app.run_server(debug=False)
+    app.run(host="0.0.0.0", port=10000, debug=False)
