@@ -1,8 +1,8 @@
-dash
-dash-bootstrap-components
-pandas
-numpy
-yfinance
-plotly
-requests
-gunicorn
+dash==2.16.1
+dash-bootstrap-components==1.5.0
+plotly==5.20.0
+yfinance==0.2.40
+pandas==2.0.3
+numpy==1.24.4
+statsmodels==0.14.1
+gunicorn==21.2.0
