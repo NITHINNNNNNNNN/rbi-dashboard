@@ -6,12 +6,16 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import warnings
+from datetime import date, timedelta
 warnings.filterwarnings("ignore")
 
+# ── CONFIG ────────────────────────────────────────────────────
 FINTECH_TICKERS = ["PAYTM.NS", "POLICYBZR.NS"]
 BANK_TICKERS    = ["HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS"]
 ALL_TICKERS     = FINTECH_TICKERS + BANK_TICKERS
 
+# ── FIX 1: RBI events — add new ones here after each MPC meeting ──
+# Format: "YYYY-MM-DD": rate_in_percent
 RBI_EVENTS = {
     "2020-03-27": 4.40, "2020-05-22": 4.00,
     "2022-05-04": 4.40, "2022-06-08": 4.90,
@@ -19,20 +23,63 @@ RBI_EVENTS = {
     "2022-12-07": 6.25, "2023-02-08": 6.50,
     "2025-02-07": 6.25, "2025-04-09": 6.00,
     "2026-04-09": 5.25,
+    # ← ADD NEW RBI EVENTS HERE as they happen
+    # Example: "2026-06-06": 5.00,
+    # Example: "2026-08-07": 4.75,
 }
 
-print("Downloading price data...")
-prices = yf.download(ALL_TICKERS, start="2020-01-01",
-                     auto_adjust=True, progress=False)["Close"]
-prices = prices.ffill()
-returns = prices.pct_change().dropna(how="all")
-print(f"Data loaded: {len(returns)} rows")
+# ── FIX 2: Always fetch data up to TODAY automatically ─────────
+TODAY = date.today().strftime("%Y-%m-%d")
 
-rbi_events = pd.Series(RBI_EVENTS, dtype=float)
-rbi_events.index = pd.to_datetime(rbi_events.index)
-rbi_rate   = rbi_events.reindex(returns.index).ffill()
-rbi_change = rbi_events.reindex(returns.index).fillna(0).diff().fillna(0)
+def load_fresh_data():
+    """Always downloads up to today's date — never stale."""
+    print(f"Downloading fresh data up to {TODAY}...")
+    prices = yf.download(
+        ALL_TICKERS,
+        start="2020-01-01",
+        end=TODAY,           # ← always today, not hardcoded
+        auto_adjust=True,
+        progress=False
+    )["Close"]
+    prices = prices.ffill()
+    returns = prices.pct_change().dropna(how="all")
+    print(f"Loaded {len(returns)} trading days up to {TODAY}")
+    return returns
 
+returns = load_fresh_data()
+
+# Latest RBI info (auto-picks the most recent event)
+latest_rbi_date = max(RBI_EVENTS.keys())
+latest_rbi_rate = RBI_EVENTS[latest_rbi_date]
+
+rbi_events_series = pd.Series(RBI_EVENTS, dtype=float)
+rbi_events_series.index = pd.to_datetime(rbi_events_series.index)
+rbi_rate   = rbi_events_series.reindex(returns.index).ffill()
+rbi_change = rbi_events_series.reindex(returns.index).fillna(0).diff().fillna(0)
+
+# ── FIX 3: Auto-refresh data every 24 hours ───────────────────
+import threading
+import time
+
+def refresh_data_daily():
+    """Background thread: reloads stock data every 24 hours."""
+    global returns, rbi_rate, rbi_change
+    while True:
+        time.sleep(86400)  # wait 24 hours
+        try:
+            print("Auto-refreshing stock data...")
+            returns = load_fresh_data()
+            rbi_rate   = rbi_events_series.reindex(returns.index).ffill()
+            rbi_change = rbi_events_series.reindex(returns.index).fillna(0).diff().fillna(0)
+            print("Data refreshed successfully!")
+        except Exception as e:
+            print(f"Refresh failed: {e}")
+
+# Start background refresh thread
+refresh_thread = threading.Thread(target=refresh_data_daily, daemon=True)
+refresh_thread.start()
+
+# ── FUNCTIONS (unchanged) ──────────────────────────────────────
 def compute_ccf(rate_change, stock_return, max_lag=60):
     aligned = pd.concat([rate_change, stock_return], axis=1).dropna()
     x = aligned.iloc[:, 0].values
@@ -88,17 +135,22 @@ def calc_success_rate(ticker, event_type, horizon):
         return 0, 0
     return round(np.mean(successes) * 100, 1), len(successes)
 
+# ── APP ───────────────────────────────────────────────────────
 app = dash.Dash(__name__,
                 external_stylesheets=[dbc.themes.FLATLY],
                 suppress_callback_exceptions=True)
-server = app.server  # Required for Render deployment
+server = app.server
+
+# Badge text auto-updates from RBI_EVENTS dict
+badge_text = f"Repo Rate: {latest_rbi_rate}% | Latest MPC: {latest_rbi_date} | Data up to: {TODAY}"
 
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col(html.H3("🏦 RBI Policy Impact — Fintech Dashboard",
-                         className="text-primary mt-3"), width=8),
-        dbc.Col(dbc.Badge("Repo Rate: 5.25% | Neutral | Apr 2026",
-                           color="info", className="mt-4 p-2"), width=4),
+                         className="text-primary mt-3"), width=7),
+        dbc.Col(dbc.Badge(badge_text,
+                           color="info", className="mt-4 p-2",
+                           style={"fontSize": "11px"}), width=5),
     ], className="mb-2"),
 
     dbc.Tabs([
